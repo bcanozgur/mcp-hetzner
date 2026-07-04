@@ -2,9 +2,11 @@
   "mcpServers": {
     "hetzner": {
       "type": "stdio",
-      "command": "mcp-hetzner",
-      "args": [],
-      "env": {}
+      "command": "uvx",
+      "args": ["--from", ".", "mcp-hetzner"],
+      "env": {
+        "HCLOUD_TOKEN": "${HCLOUD_TOKEN}"
+      }
     }
   }
 }

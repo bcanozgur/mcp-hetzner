@@ -11,4 +11,4 @@ This MCP package provides functions to manage Hetzner Cloud resources:
 - Manage SSH keys for secure server access
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

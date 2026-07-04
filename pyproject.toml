@@ -4,32 +4,64 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-hetzner"
-version = "0.1.0"
-description = "A Model Context Protocol (MCP) server for Hetzner Cloud API"
+dynamic = ["version"]
+description = "A Model Context Protocol (MCP) server for the Hetzner Cloud API — manage servers, volumes, firewalls, and SSH keys from Claude Code, Codex, Cursor, and any MCP client."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "Dennis Kruyt", email = "dennis@kruyt.org"}
+    {name = "bcanozgur"}
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "hetzner",
+    "hetzner-cloud",
+    "hcloud",
+    "llm",
+    "claude",
+    "claude-code",
+    "codex",
+    "cursor",
+    "ai",
+    "devops",
+    "infrastructure",
 ]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    "mcp",
+    "mcp>=1.0.0",
     "hcloud>=1.24.0",
     "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "twine",
 ]
 
 [tool.setuptools]
 packages = ["mcp_hetzner"]
 
+[tool.setuptools.dynamic]
+version = {attr = "mcp_hetzner.__version__"}
+
 [project.urls]
-"Homepage" = "https://github.com/denniskruyt/mcp-hetzner"
-"Bug Tracker" = "https://github.com/denniskruyt/mcp-hetzner/issues"
+"Homepage" = "https://github.com/bcanozgur/mcp-hetzner"
+"Repository" = "https://github.com/bcanozgur/mcp-hetzner"
+"Bug Tracker" = "https://github.com/bcanozgur/mcp-hetzner/issues"
 
 [project.scripts]
 mcp-hetzner = "mcp_hetzner.server:main"

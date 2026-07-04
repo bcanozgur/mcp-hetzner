@@ -12,6 +12,7 @@ This MCP service provides functions to manage Hetzner Cloud resources:
 - Manage SSH keys for secure server access
 """
 
+import logging
 import os
 import sys
 from typing import Dict, List, Optional, Any, Union
@@ -29,18 +30,50 @@ from pydantic import BaseModel, Field
 
 from mcp.server.fastmcp import FastMCP
 
-# Load environment variables from the current working directory (not the
-# installed package location), so a .env in the user's project is found.
+# All diagnostics MUST go to stderr. The stdio transport uses stdout for the
+# JSON-RPC stream, so any stray stdout write (a bare print, a traceback) would
+# corrupt the protocol and break the MCP client.
+logging.basicConfig(
+    level=os.environ.get("MCP_HETZNER_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("mcp_hetzner")
+
+# Load environment variables from a .env in the user's working directory (not
+# the installed package location) as a convenience for local development. The
+# primary, recommended mechanism is a real HCLOUD_TOKEN injected by the MCP
+# client via its `env` config block.
 dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
 
-# Check if Hetzner Cloud API token is configured
-HCLOUD_TOKEN = os.environ.get("HCLOUD_TOKEN")
-if not HCLOUD_TOKEN:
-    print("Error: HCLOUD_TOKEN environment variable not set. Please add it to your .env file.")
-    sys.exit(1)
+# The hcloud client is created lazily once a token is resolved (see
+# resolve_client). Importing this module therefore never requires a token and
+# never exits the process — important for tests, tooling, and MCP clients that
+# import before they run.
+client: Optional[Client] = None
 
-# Create Hetzner Cloud client
-client = Client(token=HCLOUD_TOKEN)
+
+def resolve_client(token: Optional[str] = None) -> Client:
+    """Resolve the Hetzner API token and initialise the module-level client.
+
+    Precedence: an explicit ``token`` argument (e.g. from ``--token``) wins,
+    otherwise the ``HCLOUD_TOKEN`` environment variable is used (which may have
+    been populated from a local ``.env``). Raises ``RuntimeError`` if neither
+    is present.
+    """
+    global client
+    resolved = token or os.environ.get("HCLOUD_TOKEN")
+    if not resolved:
+        raise RuntimeError(
+            "No Hetzner Cloud API token found. Set the HCLOUD_TOKEN environment "
+            "variable (recommended: inject it via your MCP client's `env` "
+            "config), pass --token, or add HCLOUD_TOKEN to a local .env file. "
+            "Create a token in the Hetzner Cloud Console: "
+            "Project -> Security -> API Tokens (Read & Write)."
+        )
+    client = Client(token=resolved)
+    return client
+
 
 # Create MCP server with server configuration
 mcp = FastMCP(
@@ -1324,22 +1357,34 @@ def start_server(transport="stdio", port=None):
     mcp.settings.host = host
     mcp.settings.port = port
 
-    print(f"Starting Hetzner Cloud MCP server on {host}:{port} using {transport} transport")
+    # Log to stderr only (stdout is reserved for the stdio JSON-RPC stream).
+    logger.info("Starting Hetzner Cloud MCP server using %s transport%s",
+                transport, f" on {host}:{port}" if transport == "sse" else "")
     # Run the server - this is a synchronous function that will block until the server stops
     mcp.run(transport=transport)
 
 def main():
     """Entry point for the package."""
     import argparse
-    
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Hetzner Cloud MCP Server")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
                         help="Transport to use (stdio or sse, default: stdio)")
-    parser.add_argument("--port", type=int, 
+    parser.add_argument("--port", type=int,
                         help="Port to use (overrides MCP_PORT environment variable)")
+    parser.add_argument("--token",
+                        help="Hetzner Cloud API token (overrides the HCLOUD_TOKEN environment variable)")
     args = parser.parse_args()
-    
+
+    # Resolve the API token and build the client before serving. Fail cleanly
+    # (stderr + non-zero exit) rather than crashing mid-request if it's missing.
+    try:
+        resolve_client(args.token)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
     # Run the MCP server - this is a blocking call
     start_server(transport=args.transport, port=args.port)
 
