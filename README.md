@@ -1,5 +1,9 @@
 # Hetzner Cloud MCP Server
 
+[![PyPI version](https://img.shields.io/pypi/v/mcp-hetzner.svg)](https://pypi.org/project/mcp-hetzner/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mcp-hetzner.svg)](https://pypi.org/project/mcp-hetzner/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Model Context Protocol (MCP) server for interacting with the Hetzner Cloud API. This server allows language models to manage Hetzner Cloud resources through structured functions.
 
 ![MCP Hetzner Demo](media/mcp-hetzner.gif)
@@ -34,26 +38,17 @@ You will pass this token to the MCP server through the `HCLOUD_TOKEN` environmen
 
 ## Installation
 
-The server is distributed as a Python package and runs with `uvx` (the Python equivalent of
-`npx`). `uvx` downloads the package into an isolated, cached environment and runs it — nothing
-is installed globally. Once published to PyPI you can reference it simply as `mcp-hetzner`; until
-then (or to always track the latest code), reference it straight from the Git repository:
+The server is published to [PyPI](https://pypi.org/project/mcp-hetzner/) and runs with `uvx`
+(the Python equivalent of `npx`). `uvx` downloads the package into an isolated, cached
+environment and runs it — nothing is installed globally:
 
 ```bash
-# From PyPI (once published)
 uvx mcp-hetzner
-
-# Straight from the Git repository (works today, no PyPI needed)
-uvx --from git+https://github.com/bcanozgur/mcp-hetzner.git mcp-hetzner
 ```
 
-The sections below show how to register it with each MCP client. Everywhere you see
-`"args": ["mcp-hetzner"]` (or `-- uvx mcp-hetzner`), that is the **PyPI form**.
-
-> **⚠️ Not on PyPI yet?** Until the package is published, `uvx mcp-hetzner` will fail with
-> "package not found". Use the **Git form** instead — swap `mcp-hetzner` for
-> `--from git+https://github.com/bcanozgur/mcp-hetzner.git mcp-hetzner` in any command or config
-> below. Each section shows the exact Git-form command so you can copy‑paste it directly.
+> **Tip:** To run the very latest unreleased code straight from Git instead of PyPI, replace
+> `mcp-hetzner` with `--from git+https://github.com/bcanozgur/mcp-hetzner.git mcp-hetzner` in any
+> command or config below.
 
 In every example, replace `your_token_here` with your real Hetzner Cloud API token
 (see [Getting a Hetzner Cloud API token](#getting-a-hetzner-cloud-api-token)).
@@ -63,12 +58,7 @@ In every example, replace `your_token_here` with your real Hetzner Cloud API tok
 Add the server with the built-in `claude mcp add` command, injecting your token via `-e`:
 
 ```bash
-# PyPI form (once published)
 claude mcp add hetzner -e HCLOUD_TOKEN=your_token_here -- uvx mcp-hetzner
-
-# Git form (works right now, before publishing)
-claude mcp add hetzner -e HCLOUD_TOKEN=your_token_here -- \
-  uvx --from git+https://github.com/bcanozgur/mcp-hetzner.git mcp-hetzner
 ```
 
 - Add `--scope user` to make it available across all your projects, or `--scope project` to
@@ -81,12 +71,7 @@ claude mcp add hetzner -e HCLOUD_TOKEN=your_token_here -- \
 Add the server with the `codex mcp add` command:
 
 ```bash
-# PyPI form (once published)
 codex mcp add hetzner --env HCLOUD_TOKEN=your_token_here -- uvx mcp-hetzner
-
-# Git form (works right now, before publishing)
-codex mcp add hetzner --env HCLOUD_TOKEN=your_token_here -- \
-  uvx --from git+https://github.com/bcanozgur/mcp-hetzner.git mcp-hetzner
 ```
 
 Or edit `~/.codex/config.toml` directly (note the underscore in `mcp_servers`):
@@ -94,9 +79,7 @@ Or edit `~/.codex/config.toml` directly (note the underscore in `mcp_servers`):
 ```toml
 [mcp_servers.hetzner]
 command = "uvx"
-# PyPI form:  args = ["mcp-hetzner"]
-# Git form (before publishing):
-args = ["--from", "git+https://github.com/bcanozgur/mcp-hetzner.git", "mcp-hetzner"]
+args = ["mcp-hetzner"]
 
 [mcp_servers.hetzner.env]
 HCLOUD_TOKEN = "your_token_here"
@@ -114,7 +97,7 @@ Open **Cursor Settings → MCP → Add new MCP Server**, or add this to
   "mcpServers": {
     "hetzner": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/bcanozgur/mcp-hetzner.git", "mcp-hetzner"],
+      "args": ["mcp-hetzner"],
       "env": {
         "HCLOUD_TOKEN": "your_token_here"
       }
@@ -122,8 +105,6 @@ Open **Cursor Settings → MCP → Add new MCP Server**, or add this to
   }
 }
 ```
-
-> Once the package is on PyPI, simplify `args` to just `["mcp-hetzner"]`.
 
 ### Other MCP clients (VS Code, Claude Desktop, Windsurf, …)
 
