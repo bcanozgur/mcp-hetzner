@@ -13,9 +13,12 @@ A Model Context Protocol (MCP) server for interacting with the Hetzner Cloud API
 - List, create, and manage Hetzner Cloud servers
 - Create, attach, detach, and resize volumes
 - Manage firewall rules and apply them to servers
+- Create and manage private networks — subnets, routes, and server attachment
+- Manage Hetzner DNS zones and records (separate DNS API token)
 - Create and manage SSH keys for secure server access
 - View available images, server types, and locations
 - Power on/off and reboot servers
+- Automatic retry with exponential backoff on API rate limits (HTTP 429)
 - Works with any MCP client — Claude Code, Codex, Cursor, VS Code, Claude Desktop, and more
 - Runs with a single `uvx` command; no manual install or virtualenv required
 
@@ -55,14 +58,17 @@ In every example, replace `your_token_here` with your real Hetzner Cloud API tok
 
 ### Claude Code
 
-Add the server with the built-in `claude mcp add` command, injecting your token via `-e`:
+Run this from the project where you actually want to use the server — by default `claude mcp
+add` scopes the server to your current working directory, so add it from inside whichever repo
+you'll be driving Hetzner from (you don't need to clone this repo to do that; `uvx mcp-hetzner`
+fetches the published package). Inject your token via `-e`:
 
 ```bash
 claude mcp add hetzner -e HCLOUD_TOKEN=your_token_here -- uvx mcp-hetzner
 ```
 
-- Add `--scope user` to make it available across all your projects, or `--scope project` to
-  commit it to a shared `.mcp.json` for your team.
+- Add `--scope user` to make it available across all your projects regardless of which directory
+  you run the command from, or `--scope project` to commit it to a shared `.mcp.json` for your team.
 - Verify it connected with `claude mcp list` (should report `hetzner … ✔ Connected`).
 - In a session, `/mcp` lists the active servers and their tools.
 
@@ -125,9 +131,15 @@ Every MCP client that supports stdio servers uses the same shape — a `command`
 | Environment variable    | Required | Default     | Description                                                        |
 | ----------------------- | -------- | ----------- | ------------------------------------------------------------------ |
 | `HCLOUD_TOKEN`          | **Yes**  | –           | Hetzner Cloud API token (Read & Write).                            |
+| `HETZNER_DNS_TOKEN`     | For DNS  | –           | Hetzner DNS API token — required only for the DNS tools. This is a **separate** credential from `HCLOUD_TOKEN`; create one at <https://dns.hetzner.com/settings/api-token>. |
 | `MCP_HETZNER_LOG_LEVEL` | No       | `INFO`      | Log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). Logs go to stderr. |
+| `MCP_HETZNER_MAX_RETRIES` | No     | `5`         | Max retries for rate-limited (HTTP 429) API calls.                 |
 | `MCP_HOST`              | No       | `localhost` | Bind host, used only by the `sse` transport.                       |
 | `MCP_PORT`              | No       | `8080`      | Bind port, used only by the `sse` transport.                       |
+
+> **Note:** DNS tools use Hetzner's separate DNS API, so they need `HETZNER_DNS_TOKEN`
+> in addition to `HCLOUD_TOKEN`. The Cloud tools (servers, volumes, firewalls, networks,
+> SSH keys) work with `HCLOUD_TOKEN` alone.
 
 The token can be supplied three ways, in order of precedence:
 
@@ -312,6 +324,68 @@ update_ssh_key {
 # Delete an SSH key
 delete_ssh_key {
   "ssh_key_id": 12345
+}
+```
+
+### Private Network Management
+
+```
+# Create a private network
+create_network {
+  "name": "internal",
+  "ip_range": "10.0.0.0/16"
+}
+
+# Add a subnet (required before attaching servers)
+add_subnet {
+  "network_id": 12345,
+  "ip_range": "10.0.1.0/24",
+  "network_zone": "eu-central"
+}
+
+# Attach a server to the network
+attach_server_to_network {
+  "network_id": 12345,
+  "server_id": 67890,
+  "ip": "10.0.1.5"
+}
+
+# Add a route
+add_route {
+  "network_id": 12345,
+  "destination": "10.100.1.0/24",
+  "gateway": "10.0.1.1"
+}
+```
+
+### DNS Management
+
+> Requires `HETZNER_DNS_TOKEN` (separate from `HCLOUD_TOKEN`).
+
+```
+# List DNS zones
+list_dns_zones
+
+# Create a zone (domain)
+create_dns_zone {
+  "name": "example.com"
+}
+
+# Add an A record (use "@" for the zone root)
+create_dns_record {
+  "zone_id": "abc123",
+  "type": "A",
+  "name": "www",
+  "value": "203.0.113.10",
+  "ttl": 3600
+}
+
+# Create several records at once
+bulk_create_dns_records {
+  "records": [
+    { "zone_id": "abc123", "type": "A", "name": "@", "value": "203.0.113.10" },
+    { "zone_id": "abc123", "type": "CNAME", "name": "blog", "value": "www.example.com." }
+  ]
 }
 ```
 

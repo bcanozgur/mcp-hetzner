@@ -10,20 +10,30 @@ This MCP service provides functions to manage Hetzner Cloud resources:
 - Create, manage, and apply firewalls
 - Create, attach, detach, and resize volumes
 - Manage SSH keys for secure server access
+- Create and manage private networks (subnets, routes, server attachment)
+- Manage Hetzner DNS zones and records (separate DNS API / token)
+
+All Hetzner API calls (Cloud and DNS) transparently retry on rate-limit
+(HTTP 429) responses with exponential backoff and jitter.
 """
 
+import functools
 import logging
 import os
+import random
 import sys
-from typing import Dict, List, Optional, Any, Union
+import time
+from typing import Callable, Dict, List, Optional, Any, TypeVar, Union
 
 import dotenv
-from hcloud import Client
+import requests
+from hcloud import Client, APIException
 from hcloud.images.domain import Image
 from hcloud.locations.domain import Location
 from hcloud.server_types.domain import ServerType
 from hcloud.servers.domain import Server
 from hcloud.firewalls.domain import Firewall, FirewallRule, FirewallResource, FirewallResourceLabelSelector
+from hcloud.networks.domain import Network, NetworkSubnet, NetworkRoute
 from hcloud.volumes.domain import Volume
 from hcloud.ssh_keys.domain import SSHKey
 from pydantic import BaseModel, Field
@@ -52,6 +62,65 @@ dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
 # import before they run.
 client: Optional[Client] = None
 
+# Rate-limit retry configuration. Hetzner Cloud limits API calls (3600/hour by
+# default) and answers over-limit requests with HTTP 429 / a
+# "rate_limit_exceeded" APIException. We transparently retry those with
+# exponential backoff + full jitter so bursts of tool calls don't fail hard.
+# Tunable via environment variables for operators with different limits.
+RATE_LIMIT_MAX_RETRIES = int(os.environ.get("MCP_HETZNER_MAX_RETRIES", 5))
+RATE_LIMIT_BASE_DELAY = float(os.environ.get("MCP_HETZNER_RETRY_BASE_DELAY", 1.0))
+RATE_LIMIT_MAX_DELAY = float(os.environ.get("MCP_HETZNER_RETRY_MAX_DELAY", 60.0))
+
+# Hetzner DNS is a SEPARATE product from Hetzner Cloud, served by a different
+# API host and authenticated with its own token (created at
+# https://dns.hetzner.com/settings/api-token). The hcloud SDK does not cover it,
+# so DNS tools talk to the REST API directly via _dns_request().
+DNS_API_BASE = os.environ.get("HETZNER_DNS_API_BASE", "https://dns.hetzner.com/api/v1")
+DNS_REQUEST_TIMEOUT = float(os.environ.get("MCP_HETZNER_DNS_TIMEOUT", 30.0))
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _is_rate_limit_error(exc: APIException) -> bool:
+    """True if an APIException represents a Hetzner rate-limit response.
+
+    The ``code`` may arrive as the string ``"rate_limit_exceeded"`` or as the
+    numeric HTTP status ``429`` depending on the endpoint, so we check both.
+    """
+    return exc.code in ("rate_limit_exceeded", 429)
+
+
+def _with_rate_limit_retry(request_func: F) -> F:
+    """Wrap ``Client.request`` so rate-limited calls are retried with backoff.
+
+    Every hcloud domain client (servers, volumes, networks, …) funnels its HTTP
+    calls through the single ``Client.request`` method, so wrapping that one
+    choke point transparently protects every tool in this module. Only
+    rate-limit errors are retried; all other exceptions propagate unchanged.
+    """
+
+    @functools.wraps(request_func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return request_func(*args, **kwargs)
+            except APIException as exc:
+                if not _is_rate_limit_error(exc) or attempt >= RATE_LIMIT_MAX_RETRIES:
+                    raise
+                # Exponential backoff capped at RATE_LIMIT_MAX_DELAY, with full
+                # jitter to avoid a thundering herd of synchronized retries.
+                ceiling = min(RATE_LIMIT_MAX_DELAY, RATE_LIMIT_BASE_DELAY * (2 ** attempt))
+                delay = random.uniform(0, ceiling)
+                attempt += 1
+                logger.warning(
+                    "Hetzner rate limit hit; retry %d/%d in %.2fs",
+                    attempt, RATE_LIMIT_MAX_RETRIES, delay,
+                )
+                time.sleep(delay)
+
+    return wrapper  # type: ignore[return-value]
+
 
 def resolve_client(token: Optional[str] = None) -> Client:
     """Resolve the Hetzner API token and initialise the module-level client.
@@ -72,6 +141,16 @@ def resolve_client(token: Optional[str] = None) -> Client:
             "Project -> Security -> API Tokens (Read & Write)."
         )
     client = Client(token=resolved)
+    # Transparently retry rate-limited requests for every domain client. The
+    # domain clients (servers, volumes, networks, …) all funnel their HTTP calls
+    # through the inner ClientBase's ``request`` method (``Client.request`` is a
+    # thin delegator they bypass), so we wrap that inner choke point. Fall back
+    # to the public method if the internal layout ever changes.
+    inner = getattr(client, "_client", None)
+    if inner is not None and hasattr(inner, "request"):
+        inner.request = _with_rate_limit_retry(inner.request)
+    else:  # pragma: no cover - defensive fallback for future hcloud layouts
+        client.request = _with_rate_limit_retry(client.request)
     return client
 
 
@@ -191,6 +270,42 @@ def firewall_to_dict(firewall: Firewall) -> Dict[str, Any]:
         "created": firewall.created.isoformat() if firewall.created else None,
     }
 
+# Helper function to convert Network object to dict
+def network_to_dict(network: Network) -> Dict[str, Any]:
+    """Convert a Network object to a dictionary with relevant information."""
+    subnets = []
+    if network.subnets:
+        for subnet in network.subnets:
+            subnets.append({
+                "type": subnet.type,
+                "ip_range": subnet.ip_range,
+                "network_zone": subnet.network_zone,
+                "gateway": subnet.gateway,
+                "vswitch_id": subnet.vswitch_id,
+            })
+
+    routes = []
+    if network.routes:
+        for route in network.routes:
+            routes.append({
+                "destination": route.destination,
+                "gateway": route.gateway,
+            })
+
+    return {
+        "id": network.id,
+        "name": network.name,
+        "ip_range": network.ip_range,
+        "subnets": subnets,
+        "routes": routes,
+        "servers": [server.id for server in network.servers] if network.servers else [],
+        "protection": {
+            "delete": network.protection["delete"] if network.protection else False,
+        },
+        "labels": network.labels,
+        "created": network.created.isoformat() if network.created else None,
+    }
+
 # Create Server Parameters Model
 class CreateServerParams(BaseModel):
     name: str = Field(..., description="Name of the server")
@@ -285,6 +400,117 @@ class UpdateSSHKeyParams(BaseModel):
     ssh_key_id: int = Field(..., description="The ID of the SSH key")
     name: str = Field(..., description="New name for the SSH key")
     labels: Optional[Dict[str, str]] = Field(None, description="User-defined labels (key-value pairs)")
+
+# Network ID Parameter Model
+class NetworkIdParam(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+
+# Create Network Parameter Model
+class CreateNetworkParams(BaseModel):
+    name: str = Field(..., description="Name of the network")
+    ip_range: str = Field(..., description="IP range of the whole network in CIDR notation (e.g., '10.0.0.0/16')")
+    expose_routes_to_vswitch: Optional[bool] = Field(None, description="Expose routes to connected vSwitch (advanced)")
+    labels: Optional[Dict[str, str]] = Field(None, description="User-defined labels (key-value pairs)")
+
+# Update Network Parameter Model
+class UpdateNetworkParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    name: Optional[str] = Field(None, description="New name for the network")
+    expose_routes_to_vswitch: Optional[bool] = Field(None, description="Expose routes to connected vSwitch (advanced)")
+    labels: Optional[Dict[str, str]] = Field(None, description="User-defined labels (key-value pairs)")
+
+# Add Subnet Parameter Model
+class AddSubnetParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    ip_range: str = Field(..., description="IP range of the subnet in CIDR notation, within the network range (e.g., '10.0.1.0/24')")
+    network_zone: str = Field(..., description="Network zone of the subnet (e.g., 'eu-central', 'us-east', 'us-west', 'ap-southeast')")
+    type: Optional[str] = Field("cloud", description="Subnet type: 'cloud' (default), 'server', or 'vswitch'")
+    vswitch_id: Optional[int] = Field(None, description="ID of the vSwitch (required only when type is 'vswitch')")
+
+# Delete Subnet Parameter Model
+class DeleteSubnetParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    ip_range: str = Field(..., description="IP range of the subnet to delete in CIDR notation")
+
+# Add Route Parameter Model
+class AddRouteParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    destination: str = Field(..., description="Destination network or host in CIDR notation (e.g., '10.100.1.0/24')")
+    gateway: str = Field(..., description="Gateway IP address for the route (must be within the network range)")
+
+# Delete Route Parameter Model
+class DeleteRouteParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    destination: str = Field(..., description="Destination of the route to delete in CIDR notation")
+    gateway: str = Field(..., description="Gateway IP address of the route to delete")
+
+# Server<->Network Attach Parameter Model
+class AttachServerToNetworkParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    server_id: int = Field(..., description="The ID of the server to attach")
+    ip: Optional[str] = Field(None, description="Specific private IP to assign the server within the network (optional)")
+    alias_ips: Optional[List[str]] = Field(None, description="Additional alias IPs to assign to the server (optional)")
+
+# Server<->Network Detach Parameter Model
+class DetachServerFromNetworkParams(BaseModel):
+    network_id: int = Field(..., description="The ID of the network")
+    server_id: int = Field(..., description="The ID of the server to detach")
+
+# DNS Zone ID Parameter Model
+class DNSZoneIdParam(BaseModel):
+    zone_id: str = Field(..., description="The ID of the DNS zone")
+
+# List DNS Zones Parameter Model
+class ListDNSZonesParams(BaseModel):
+    name: Optional[str] = Field(None, description="Full name of a zone to filter by (e.g., 'example.com')")
+    search_name: Optional[str] = Field(None, description="Partial name to search zones by")
+
+# Create DNS Zone Parameter Model
+class CreateDNSZoneParams(BaseModel):
+    name: str = Field(..., description="Name of the zone / domain (e.g., 'example.com')")
+    ttl: Optional[int] = Field(None, description="Default TTL for records in the zone, in seconds")
+
+# Update DNS Zone Parameter Model
+class UpdateDNSZoneParams(BaseModel):
+    zone_id: str = Field(..., description="The ID of the DNS zone")
+    name: str = Field(..., description="Name of the zone / domain")
+    ttl: Optional[int] = Field(None, description="Default TTL for records in the zone, in seconds")
+
+# DNS Record ID Parameter Model
+class DNSRecordIdParam(BaseModel):
+    record_id: str = Field(..., description="The ID of the DNS record")
+
+# List DNS Records Parameter Model
+class ListDNSRecordsParams(BaseModel):
+    zone_id: str = Field(..., description="The ID of the DNS zone whose records to list")
+
+# Create DNS Record Parameter Model
+class CreateDNSRecordParams(BaseModel):
+    zone_id: str = Field(..., description="The ID of the DNS zone the record belongs to")
+    type: str = Field(..., description="Record type (e.g., A, AAAA, CNAME, MX, TXT, NS, SRV, CAA)")
+    name: str = Field(..., description="Record name; use '@' for the zone root (e.g., 'www', '@')")
+    value: str = Field(..., description="Record value (e.g., an IP for A records, a hostname for CNAME)")
+    ttl: Optional[int] = Field(None, description="Time to live in seconds (falls back to the zone default if omitted)")
+
+# Update DNS Record Parameter Model
+class UpdateDNSRecordParams(BaseModel):
+    record_id: str = Field(..., description="The ID of the DNS record to update")
+    zone_id: str = Field(..., description="The ID of the DNS zone the record belongs to")
+    type: str = Field(..., description="Record type (e.g., A, AAAA, CNAME, MX, TXT, NS, SRV, CAA)")
+    name: str = Field(..., description="Record name; use '@' for the zone root")
+    value: str = Field(..., description="Record value")
+    ttl: Optional[int] = Field(None, description="Time to live in seconds")
+
+# Bulk Create DNS Records Parameter Model
+class BulkDNSRecord(BaseModel):
+    zone_id: str = Field(..., description="The ID of the DNS zone the record belongs to")
+    type: str = Field(..., description="Record type (e.g., A, AAAA, CNAME, MX, TXT)")
+    name: str = Field(..., description="Record name; use '@' for the zone root")
+    value: str = Field(..., description="Record value")
+    ttl: Optional[int] = Field(None, description="Time to live in seconds")
+
+class BulkCreateDNSRecordsParams(BaseModel):
+    records: List[BulkDNSRecord] = Field(..., description="List of DNS records to create in a single request")
 
 # MCP Tools
 
@@ -1338,6 +1564,578 @@ def delete_ssh_key(params: SSHKeyIdParam) -> Dict[str, Any]:
         return {"success": success}
     except Exception as e:
         return {"error": f"Failed to delete SSH key: {str(e)}"}
+
+# Network-related MCP tools
+
+# Helper function to convert an Action object to dict
+def _action_to_dict(action) -> Optional[Dict[str, Any]]:
+    """Convert an hcloud Action object to a dictionary, or None if absent."""
+    if not action:
+        return None
+    return {
+        "id": action.id,
+        "status": action.status,
+        "command": action.command,
+        "progress": action.progress,
+        "error": action.error,
+        "started": action.started.isoformat() if action.started else None,
+        "finished": action.finished.isoformat() if action.finished else None,
+    }
+
+@mcp.tool()
+def list_networks() -> Dict[str, Any]:
+    """
+    List all private networks in your Hetzner Cloud account.
+
+    Returns a list of all networks with their subnets, routes, and attached servers.
+
+    Example:
+    - Basic list: list_networks()
+    """
+    try:
+        networks = client.networks.get_all()
+        return {
+            "networks": [network_to_dict(network) for network in networks]
+        }
+    except Exception as e:
+        return {"error": f"Failed to list networks: {str(e)}"}
+
+@mcp.tool()
+def get_network(params: NetworkIdParam) -> Dict[str, Any]:
+    """
+    Get details about a specific private network.
+
+    Returns detailed information about a network identified by its ID.
+
+    Example:
+    - Get network details: {"network_id": 12345}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        return {"network": network_to_dict(network)}
+    except Exception as e:
+        return {"error": f"Failed to get network: {str(e)}"}
+
+@mcp.tool()
+def create_network(params: CreateNetworkParams) -> Dict[str, Any]:
+    """
+    Create a new private network.
+
+    Creates a private network spanning a given IP range. Add subnets afterwards
+    with add_subnet before attaching servers.
+
+    Examples:
+    - Basic network: {"name": "internal", "ip_range": "10.0.0.0/16"}
+    - With labels: {"name": "prod-net", "ip_range": "10.0.0.0/16", "labels": {"env": "production"}}
+    """
+    try:
+        network = client.networks.create(
+            name=params.name,
+            ip_range=params.ip_range,
+            expose_routes_to_vswitch=params.expose_routes_to_vswitch,
+            labels=params.labels,
+        )
+
+        return {"network": network_to_dict(network)}
+    except Exception as e:
+        return {"error": f"Failed to create network: {str(e)}"}
+
+@mcp.tool()
+def update_network(params: UpdateNetworkParams) -> Dict[str, Any]:
+    """
+    Update a private network.
+
+    Updates the name, labels, or vSwitch route exposure of an existing network.
+
+    Examples:
+    - Rename: {"network_id": 12345, "name": "new-name"}
+    - Update labels: {"network_id": 12345, "labels": {"env": "staging"}}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        updated = client.networks.update(
+            network=network,
+            name=params.name,
+            expose_routes_to_vswitch=params.expose_routes_to_vswitch,
+            labels=params.labels,
+        )
+
+        return {"network": network_to_dict(updated)}
+    except Exception as e:
+        return {"error": f"Failed to update network: {str(e)}"}
+
+@mcp.tool()
+def delete_network(params: NetworkIdParam) -> Dict[str, Any]:
+    """
+    Delete a private network.
+
+    Permanently deletes a network identified by its ID. Servers must be detached first.
+
+    Example:
+    - Delete network: {"network_id": 12345}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        success = client.networks.delete(network)
+
+        return {"success": success}
+    except Exception as e:
+        return {"error": f"Failed to delete network: {str(e)}"}
+
+@mcp.tool()
+def add_subnet(params: AddSubnetParams) -> Dict[str, Any]:
+    """
+    Add a subnet to a private network.
+
+    Servers can only be attached to a network that has at least one subnet.
+
+    Examples:
+    - Cloud subnet: {"network_id": 12345, "ip_range": "10.0.1.0/24", "network_zone": "eu-central"}
+    - vSwitch subnet: {"network_id": 12345, "ip_range": "10.0.2.0/24", "network_zone": "eu-central", "type": "vswitch", "vswitch_id": 1000}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        subnet = NetworkSubnet(
+            ip_range=params.ip_range,
+            type=params.type,
+            network_zone=params.network_zone,
+            vswitch_id=params.vswitch_id,
+        )
+        action = client.networks.add_subnet(network=network, subnet=subnet)
+
+        return {"success": True, "action": _action_to_dict(action)}
+    except Exception as e:
+        return {"error": f"Failed to add subnet: {str(e)}"}
+
+@mcp.tool()
+def delete_subnet(params: DeleteSubnetParams) -> Dict[str, Any]:
+    """
+    Delete a subnet from a private network.
+
+    The subnet must have no servers attached to it.
+
+    Example:
+    - Delete subnet: {"network_id": 12345, "ip_range": "10.0.1.0/24"}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        subnet = NetworkSubnet(ip_range=params.ip_range)
+        action = client.networks.delete_subnet(network=network, subnet=subnet)
+
+        return {"success": True, "action": _action_to_dict(action)}
+    except Exception as e:
+        return {"error": f"Failed to delete subnet: {str(e)}"}
+
+@mcp.tool()
+def add_route(params: AddRouteParams) -> Dict[str, Any]:
+    """
+    Add a route to a private network.
+
+    Routes direct traffic for a destination CIDR to a gateway inside the network.
+
+    Example:
+    - Add route: {"network_id": 12345, "destination": "10.100.1.0/24", "gateway": "10.0.1.1"}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        route = NetworkRoute(destination=params.destination, gateway=params.gateway)
+        action = client.networks.add_route(network=network, route=route)
+
+        return {"success": True, "action": _action_to_dict(action)}
+    except Exception as e:
+        return {"error": f"Failed to add route: {str(e)}"}
+
+@mcp.tool()
+def delete_route(params: DeleteRouteParams) -> Dict[str, Any]:
+    """
+    Delete a route from a private network.
+
+    Example:
+    - Delete route: {"network_id": 12345, "destination": "10.100.1.0/24", "gateway": "10.0.1.1"}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        route = NetworkRoute(destination=params.destination, gateway=params.gateway)
+        action = client.networks.delete_route(network=network, route=route)
+
+        return {"success": True, "action": _action_to_dict(action)}
+    except Exception as e:
+        return {"error": f"Failed to delete route: {str(e)}"}
+
+@mcp.tool()
+def attach_server_to_network(params: AttachServerToNetworkParams) -> Dict[str, Any]:
+    """
+    Attach a server to a private network.
+
+    Gives the server a private interface on the network. Optionally pin a
+    specific private IP and/or assign alias IPs.
+
+    Examples:
+    - Basic attach: {"network_id": 12345, "server_id": 67890}
+    - With fixed IP: {"network_id": 12345, "server_id": 67890, "ip": "10.0.1.5"}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        server = client.servers.get_by_id(params.server_id)
+        if not server:
+            return {"error": f"Server with ID {params.server_id} not found"}
+
+        action = client.servers.attach_to_network(
+            server=server,
+            network=network,
+            ip=params.ip,
+            alias_ips=params.alias_ips,
+        )
+
+        return {"success": True, "action": _action_to_dict(action)}
+    except Exception as e:
+        return {"error": f"Failed to attach server to network: {str(e)}"}
+
+@mcp.tool()
+def detach_server_from_network(params: DetachServerFromNetworkParams) -> Dict[str, Any]:
+    """
+    Detach a server from a private network.
+
+    Removes the server's private interface on the given network.
+
+    Example:
+    - Detach: {"network_id": 12345, "server_id": 67890}
+    """
+    try:
+        network = client.networks.get_by_id(params.network_id)
+        if not network:
+            return {"error": f"Network with ID {params.network_id} not found"}
+
+        server = client.servers.get_by_id(params.server_id)
+        if not server:
+            return {"error": f"Server with ID {params.server_id} not found"}
+
+        action = client.servers.detach_from_network(server=server, network=network)
+
+        return {"success": True, "action": _action_to_dict(action)}
+    except Exception as e:
+        return {"error": f"Failed to detach server from network: {str(e)}"}
+
+# DNS-related MCP tools
+#
+# Hetzner DNS is a separate service with its own REST API and token, so these
+# tools bypass the hcloud SDK and call the API directly.
+
+def _dns_token() -> str:
+    """Resolve the Hetzner DNS API token from the environment.
+
+    Kept separate from the Cloud token (HCLOUD_TOKEN) because DNS uses a
+    distinct credential. Raises RuntimeError with actionable guidance if unset.
+    """
+    token = os.environ.get("HETZNER_DNS_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "No Hetzner DNS API token found. Set the HETZNER_DNS_TOKEN "
+            "environment variable (create one at "
+            "https://dns.hetzner.com/settings/api-token). Note this is separate "
+            "from the Hetzner Cloud HCLOUD_TOKEN."
+        )
+    return token
+
+
+def _dns_request(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Perform a request against the Hetzner DNS REST API.
+
+    Rate-limit (HTTP 429) responses are retried transparently with the same
+    exponential-backoff-with-jitter policy used for Cloud API calls. Returns the
+    parsed JSON body (an empty dict for empty/no-content responses). Raises on
+    non-2xx responses with the API's error message when available.
+    """
+    url = f"{DNS_API_BASE}{path}"
+    headers = {"Auth-API-Token": _dns_token(), "Content-Type": "application/json"}
+
+    attempt = 0
+    while True:
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json=json_body,
+            timeout=DNS_REQUEST_TIMEOUT,
+        )
+
+        if response.status_code == 429 and attempt < RATE_LIMIT_MAX_RETRIES:
+            ceiling = min(RATE_LIMIT_MAX_DELAY, RATE_LIMIT_BASE_DELAY * (2 ** attempt))
+            delay = random.uniform(0, ceiling)
+            attempt += 1
+            logger.warning(
+                "Hetzner DNS rate limit hit; retry %d/%d in %.2fs",
+                attempt, RATE_LIMIT_MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
+            continue
+
+        if not response.ok:
+            # Surface the API's error message when it provides one.
+            try:
+                detail = response.json()
+                message = detail.get("message") or detail.get("error") or detail
+            except ValueError:
+                message = response.text
+            raise RuntimeError(f"HTTP {response.status_code}: {message}")
+
+        if not response.content:
+            return {}
+        return response.json()
+
+@mcp.tool()
+def list_dns_zones(params: Optional[ListDNSZonesParams] = None) -> Dict[str, Any]:
+    """
+    List all DNS zones in your Hetzner DNS account.
+
+    Optionally filter by exact name or partial search name.
+
+    Examples:
+    - All zones: list_dns_zones()
+    - By name: {"name": "example.com"}
+    - Search: {"search_name": "example"}
+    """
+    try:
+        query: Dict[str, Any] = {}
+        if params and params.name:
+            query["name"] = params.name
+        if params and params.search_name:
+            query["search_name"] = params.search_name
+
+        data = _dns_request("GET", "/zones", params=query or None)
+        return {"zones": data.get("zones", [])}
+    except Exception as e:
+        return {"error": f"Failed to list DNS zones: {str(e)}"}
+
+@mcp.tool()
+def get_dns_zone(params: DNSZoneIdParam) -> Dict[str, Any]:
+    """
+    Get details about a specific DNS zone.
+
+    Example:
+    - Get zone: {"zone_id": "abc123"}
+    """
+    try:
+        data = _dns_request("GET", f"/zones/{params.zone_id}")
+        return {"zone": data.get("zone", data)}
+    except Exception as e:
+        return {"error": f"Failed to get DNS zone: {str(e)}"}
+
+@mcp.tool()
+def create_dns_zone(params: CreateDNSZoneParams) -> Dict[str, Any]:
+    """
+    Create a new DNS zone (domain).
+
+    After creating the zone, point your domain's nameservers at Hetzner's
+    (returned in the zone's 'ns' field) and add records with create_dns_record.
+
+    Examples:
+    - Basic: {"name": "example.com"}
+    - With TTL: {"name": "example.com", "ttl": 86400}
+    """
+    try:
+        body: Dict[str, Any] = {"name": params.name}
+        if params.ttl is not None:
+            body["ttl"] = params.ttl
+
+        data = _dns_request("POST", "/zones", json_body=body)
+        return {"zone": data.get("zone", data)}
+    except Exception as e:
+        return {"error": f"Failed to create DNS zone: {str(e)}"}
+
+@mcp.tool()
+def update_dns_zone(params: UpdateDNSZoneParams) -> Dict[str, Any]:
+    """
+    Update a DNS zone.
+
+    Example:
+    - Update TTL: {"zone_id": "abc123", "name": "example.com", "ttl": 3600}
+    """
+    try:
+        body: Dict[str, Any] = {"name": params.name}
+        if params.ttl is not None:
+            body["ttl"] = params.ttl
+
+        data = _dns_request("PUT", f"/zones/{params.zone_id}", json_body=body)
+        return {"zone": data.get("zone", data)}
+    except Exception as e:
+        return {"error": f"Failed to update DNS zone: {str(e)}"}
+
+@mcp.tool()
+def delete_dns_zone(params: DNSZoneIdParam) -> Dict[str, Any]:
+    """
+    Delete a DNS zone.
+
+    Permanently deletes the zone and all of its records.
+
+    Example:
+    - Delete zone: {"zone_id": "abc123"}
+    """
+    try:
+        _dns_request("DELETE", f"/zones/{params.zone_id}")
+        return {"success": True}
+    except Exception as e:
+        return {"error": f"Failed to delete DNS zone: {str(e)}"}
+
+@mcp.tool()
+def list_dns_records(params: ListDNSRecordsParams) -> Dict[str, Any]:
+    """
+    List all records in a DNS zone.
+
+    Example:
+    - List records: {"zone_id": "abc123"}
+    """
+    try:
+        data = _dns_request("GET", "/records", params={"zone_id": params.zone_id})
+        return {"records": data.get("records", [])}
+    except Exception as e:
+        return {"error": f"Failed to list DNS records: {str(e)}"}
+
+@mcp.tool()
+def get_dns_record(params: DNSRecordIdParam) -> Dict[str, Any]:
+    """
+    Get details about a specific DNS record.
+
+    Example:
+    - Get record: {"record_id": "rec123"}
+    """
+    try:
+        data = _dns_request("GET", f"/records/{params.record_id}")
+        return {"record": data.get("record", data)}
+    except Exception as e:
+        return {"error": f"Failed to get DNS record: {str(e)}"}
+
+@mcp.tool()
+def create_dns_record(params: CreateDNSRecordParams) -> Dict[str, Any]:
+    """
+    Create a new DNS record in a zone.
+
+    Use '@' as the name for the zone root (apex).
+
+    Examples:
+    - A record: {"zone_id": "abc123", "type": "A", "name": "www", "value": "203.0.113.10"}
+    - Root A record: {"zone_id": "abc123", "type": "A", "name": "@", "value": "203.0.113.10", "ttl": 3600}
+    - CNAME: {"zone_id": "abc123", "type": "CNAME", "name": "blog", "value": "www.example.com."}
+    """
+    try:
+        body: Dict[str, Any] = {
+            "zone_id": params.zone_id,
+            "type": params.type,
+            "name": params.name,
+            "value": params.value,
+        }
+        if params.ttl is not None:
+            body["ttl"] = params.ttl
+
+        data = _dns_request("POST", "/records", json_body=body)
+        return {"record": data.get("record", data)}
+    except Exception as e:
+        return {"error": f"Failed to create DNS record: {str(e)}"}
+
+@mcp.tool()
+def update_dns_record(params: UpdateDNSRecordParams) -> Dict[str, Any]:
+    """
+    Update an existing DNS record.
+
+    All core fields (zone_id, type, name, value) must be provided as the DNS API
+    replaces the record.
+
+    Example:
+    - Update value: {"record_id": "rec123", "zone_id": "abc123", "type": "A", "name": "www", "value": "203.0.113.20"}
+    """
+    try:
+        body: Dict[str, Any] = {
+            "zone_id": params.zone_id,
+            "type": params.type,
+            "name": params.name,
+            "value": params.value,
+        }
+        if params.ttl is not None:
+            body["ttl"] = params.ttl
+
+        data = _dns_request("PUT", f"/records/{params.record_id}", json_body=body)
+        return {"record": data.get("record", data)}
+    except Exception as e:
+        return {"error": f"Failed to update DNS record: {str(e)}"}
+
+@mcp.tool()
+def delete_dns_record(params: DNSRecordIdParam) -> Dict[str, Any]:
+    """
+    Delete a DNS record.
+
+    Example:
+    - Delete record: {"record_id": "rec123"}
+    """
+    try:
+        _dns_request("DELETE", f"/records/{params.record_id}")
+        return {"success": True}
+    except Exception as e:
+        return {"error": f"Failed to delete DNS record: {str(e)}"}
+
+@mcp.tool()
+def bulk_create_dns_records(params: BulkCreateDNSRecordsParams) -> Dict[str, Any]:
+    """
+    Create multiple DNS records in a single request.
+
+    Returns the created records along with any records the API rejected.
+
+    Example:
+    - {"records": [
+        {"zone_id": "abc123", "type": "A", "name": "www", "value": "203.0.113.10"},
+        {"zone_id": "abc123", "type": "A", "name": "api", "value": "203.0.113.11"}
+      ]}
+    """
+    try:
+        records = []
+        for record in params.records:
+            entry: Dict[str, Any] = {
+                "zone_id": record.zone_id,
+                "type": record.type,
+                "name": record.name,
+                "value": record.value,
+            }
+            if record.ttl is not None:
+                entry["ttl"] = record.ttl
+            records.append(entry)
+
+        data = _dns_request("POST", "/records/bulk", json_body={"records": records})
+        return {
+            "records": data.get("records", []),
+            "valid_records": data.get("valid_records", []),
+            "invalid_records": data.get("invalid_records", []),
+        }
+    except Exception as e:
+        return {"error": f"Failed to bulk create DNS records: {str(e)}"}
 
 def start_server(transport="stdio", port=None):
     """Start the MCP server.
