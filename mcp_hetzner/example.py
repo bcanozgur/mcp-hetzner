@@ -16,8 +16,9 @@ from mcp.client import Client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-dotenv.load_dotenv()
+# Load environment variables from the current working directory (not the
+# installed package location), so a .env in the user's project is found.
+dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
 
 # Check if Hetzner Cloud API token is configured
 HCLOUD_TOKEN = os.environ.get("HCLOUD_TOKEN")

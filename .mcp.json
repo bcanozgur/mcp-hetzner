@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "hetzner": {
+      "type": "stdio",
+      "command": "mcp-hetzner",
+      "args": [],
+      "env": {}
+    }
+  }
+}

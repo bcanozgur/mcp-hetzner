@@ -29,8 +29,9 @@ from pydantic import BaseModel, Field
 
 from mcp.server.fastmcp import FastMCP
 
-# Load environment variables
-dotenv.load_dotenv()
+# Load environment variables from the current working directory (not the
+# installed package location), so a .env in the user's project is found.
+dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
 
 # Check if Hetzner Cloud API token is configured
 HCLOUD_TOKEN = os.environ.get("HCLOUD_TOKEN")
@@ -1318,9 +1319,11 @@ def start_server(transport="stdio", port=None):
     else:
         port = int(port)
         
-    # Update the server port if it was specified
-    mcp.port = port
-    
+    # Update the server port if it was specified (FastMCP reads its actual
+    # runtime config from .settings, not a plain .port attribute)
+    mcp.settings.host = host
+    mcp.settings.port = port
+
     print(f"Starting Hetzner Cloud MCP server on {host}:{port} using {transport} transport")
     # Run the server - this is a synchronous function that will block until the server stops
     mcp.run(transport=transport)
